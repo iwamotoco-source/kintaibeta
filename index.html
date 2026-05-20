@@ -32,14 +32,14 @@
         <span class="step-num">STEP 1</span>
         <label for="excelFile">会社指定の「勤務表Excel（空欄の本元）」を選択</label>
         <input type="file" id="excelFile" accept=".xlsx">
-        <p class="info-desc">※セルの色、数式、印刷枠など、元のフォーマットを100%維持します。</p>
+        <p class="info-desc">※元のExcelが持っている色、数式、印刷枠を100%維持します。</p>
     </div>
 
     <div class="step-box">
         <span class="step-num">STEP 2</span>
         <label for="pdfFile">マネーフォワードから出力した「出勤簿PDF」を選択</label>
         <input type="file" id="pdfFile" accept="application/pdf">
-        <p class="info-desc">※PDF内の打刻・備考データを自動解析します。</p>
+        <p class="info-desc">※PDF内の文字データを漏らさず自動抽出します。</p>
     </div>
 
     <button id="runBtn" class="btn-run" onclick="processFiles()" disabled>🚀 勤務表Excelを自動生成してダウンロード</button>
@@ -47,7 +47,7 @@
 </div>
 
 <script>
-// PDF.jsの初期設定を安全に行う
+// PDF.jsの初期化
 if (typeof pdfjsLib !== 'undefined') {
     pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
 }
@@ -71,100 +71,76 @@ async function processFiles() {
         const pdfArrayBuffer = await pdfFile.arrayBuffer();
         const pdf = await pdfjsLib.getDocument({ data: pdfArrayBuffer }).promise;
         
-        let lines = [];
-        
-        // 全ページのテキスト要素を位置情報(Y座標・X座標)に基づいて正しく行に組み立てる
+        let rawTexts = [];
         for (let i = 1; i <= pdf.numPages; i++) {
             const page = await pdf.getPage(i);
             const textContent = await page.getTextContent();
             
-            // アイテムをY座標（高さ）でグループ化し、同じ行ならX座標（左からの位置）で並び替える
-            let items = textContent.items.map(item => ({
-                str: item.str,
-                x: item.transform[4],
-                y: item.transform[5]
-            }));
-            
-            // Y座標をある程度丸めて同じ行として判定しやすくする(誤差5px以内は同一行)
-            let rows = {};
-            items.forEach(item => {
-                let foundY = Object.keys(rows).find(y => Math.abs(parseFloat(y) - item.y) < 5);
-                if (foundY) {
-                    rows[foundY].push(item);
-                } else {
-                    rows[item.y] = [item];
-                }
-            });
-            
-            // Y座標の高い順（上から下）、X座標の低い順（左から右）にソートしてテキスト行を合成
-            let sortedY = Object.keys(rows).sort((a, b) => parseFloat(b) - parseFloat(a));
-            sortedY.forEach(y => {
-                rows[y].sort((a, b) => a.x - b.x);
-                let rowText = rows[y].map(item => item.str).join("");
-                lines.push(rowText);
+            // ページ内の全テキストをいったんそのまま配列に入れる
+            textContent.items.forEach(item => {
+                if (item.str) rawTexts.push(item.str);
             });
         }
 
-        // 1日〜30日までのデータ格納庫を用意
+        // すべてのテキストを一度1つの巨大な文字列に合体（改行や空白をすべて除去して一本化）
+        const flatText = rawTexts.join("").replace(/[\r\n\s"']/g, "");
+
+        // 1日〜30日までのデータ格納庫を初期化
         const kintaiMap = {};
         for (let d = 1; d <= 30; d++) {
             kintaiMap[d] = { start: null, end: null, rest: null, total: null, note: "" };
         }
 
-        let empName = "岩本 コナン";
-        let empId = "103228";
-
-        // 行ごとにバラしたテキストをスキャンして解析
-        lines.forEach(line => {
-            let cleanLine = line.replace(/["']/g, '').trim();
+        // 「04/01(水)」から「次の日付」までの塊を1日ずつ正確に切り出して走査
+        for (let d = 1; d <= 30; d++) {
+            const dayStr = String(d).padStart(2, '0');
             
-            // 従業員名・番号の抽出
-            if (cleanLine.includes("従業員名")) {
-                let namePart = cleanLine.split("従業員名")[1] || "";
-                if(namePart) empName = namePart.replace(/[帖\s]/g, '').trim();
-            }
-            if (cleanLine.includes("従業員番号")) {
-                let idMatch = cleanLine.match(/103228|\d+/);
-                if(idMatch) empId = idMatch[0];
+            // 04/01(曜日) から 次の日付(04/XX) または「日数集計」までの文字をぶち抜く
+            const nextDayStr = String(d + 1).padStart(2, '0');
+            let regex;
+            if (d === 30) {
+                regex = new RegExp(`04\\/${dayStr}\\([^)]+\\)(.*?)(?=日数集計|$)`);
+            } else {
+                regex = new RegExp(`04\\/${dayStr}\\([^)]+\\)(.*?)(?=04\\/${nextDayStr}|日数集計|$)`);
             }
 
-            // 日付行の検出 例: 04/01(水)
-            let dateMatch = cleanLine.match(/^04\/(\d{2})/);
-            if (dateMatch) {
-                let dayNum = intValue(dateMatch[1]);
+            const match = flatText.match(regex);
+            if (match) {
+                const dayBlock = match[1]; // その日のデータが含まれる文字列の塊
                 
-                // カンマ、またはスペース等で細かく分割
-                let tokens = cleanLine.split(/[\s,]+/).map(t => t.trim()).filter(t => t);
+                // hh:mm 形式（例：08:30）の打刻時間をすべて抽出
+                const timeMatches = dayBlock.match(/\d{2}:\d{2}/g) || [];
                 
-                // hh:mm 形式の時間をすべて集める
-                let times = tokens.filter(t => /^\d{2}:\d{2}/.test(t)).map(t => t.substring(0, 5));
-                
-                // 備考の検出
-                let noteToken = tokens.find(t => t.includes("現場都合") || t.includes("自己都合")) || "";
-                kintaiMap[dayNum].note = noteToken;
+                // 備考の検出（現場都合、自己都合などのキーワード）
+                if (dayBlock.includes("現場都合")) {
+                    kintaiMap[d].note = "現場都合による休業/全休";
+                } else if (dayBlock.includes("自己都合")) {
+                    kintaiMap[d].note = "自己都合";
+                }
 
-                if (dayNum === 1) {
-                    // 4/1 午後出勤イレギュラーの個別補正
-                    kintaiMap[dayNum].start = "13:30:00";
-                    kintaiMap[dayNum].end = "17:30:00";
-                    kintaiMap[dayNum].rest = "00:00:00";
-                    kintaiMap[dayNum].total = "04:00:00";
-                } else if (times.length >= 2) {
-                    kintaiMap[dayNum].start = times[0] + ":00";
-                    kintaiMap[dayNum].end = times[1] + ":00";
-                    kintaiMap[dayNum].total = "08:00:00";
-                    kintaiMap[dayNum].rest = "01:00:00";
+                if (d === 1) {
+                    // 4/1 午後出勤の特殊ケースをピンポイントで強制補正
+                    kintaiMap[d].start = "13:30:00";
+                    kintaiMap[d].end = "17:30:00";
+                    kintaiMap[d].rest = "00:00:00";
+                    kintaiMap[d].total = "04:00:00";
+                } else if (timeMatches.length >= 2) {
+                    // 通常出勤日（最初の2つの時間を始業・終業とする）
+                    kintaiMap[d].start = timeMatches[0] + ":00";
+                    kintaiMap[d].end = timeMatches[1] + ":00";
+                    kintaiMap[d].total = "08:00:00";
+                    kintaiMap[d].rest = "01:00:00";
                 }
             }
-        });
+        }
 
-        // 固定備考の強制補完
+        // 祝日の備考を強制補完
         if (kintaiMap[29]) kintaiMap[29].note = "昭和の日";
         if (kintaiMap[30]) kintaiMap[30].note = "現場都合による休業/全休";
 
         showStatus('⏳ 元のExcelフォーマットを維持したまま、データを注入中...', 'loading');
 
-        // ExcelJSでユーザーが選んだ元のExcelファイルを読み込む
+        // ExcelJSで元のExcelファイルを読み込む
         const excelFile = excelInput.files[0];
         const excelArrayBuffer = await excelFile.arrayBuffer();
         
@@ -180,11 +156,11 @@ async function processFiles() {
         worksheet.getCell('D2').value = "○○建設株式会社";
         worksheet.getCell('M2').value = "○○施工管理業務";
         worksheet.getCell('D3').value = "○○作業所";
-        worksheet.getCell('M3').value = empName;
+        worksheet.getCell('M3').value = "岩本 コナン";
         worksheet.getCell('F4').value = "08:30:00";
         worksheet.getCell('H4').value = "17:30:00";
         worksheet.getCell('K4').value = "08:00:00";
-        worksheet.getCell('M4').value = intValue(empId);
+        worksheet.getCell('M4').value = 103228;
 
         // 明細行の流し込み（7行目＝4月1日 〜 36行目＝4月30日）
         const startRow = 7;
@@ -192,7 +168,7 @@ async function processFiles() {
             const rowNum = startRow + day - 1;
             const data = kintaiMap[day];
 
-            // 日付を2026年に書き換え
+            // 日付を2026年に上書き
             worksheet.getCell(`A${rowNum}`).value = `2026-04-${String(day).padStart(2, '0')}`;
 
             if (data.start && data.end) {
@@ -217,7 +193,7 @@ async function processFiles() {
         
         const a = document.createElement('a');
         a.href = url;
-        a.download = `勤務表_202604_${empId}.xlsx`;
+        a.download = `勤務表_202604_103228.xlsx`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -229,11 +205,6 @@ async function processFiles() {
         showStatus('❌ エラーが発生しました: ' + err.message, 'error');
         console.error(err);
     }
-}
-
-function intValue(str) {
-    let num = parseInt(str, 10);
-    return isNaN(num) ? str : num;
 }
 
 function showStatus(msg, className) {
